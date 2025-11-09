@@ -1,147 +1,89 @@
-# ==================== IMPORTS ====================
+"""
+Flask Backend Server for Tidé Hotels PMS
+Provides REST API endpoints and WebSocket real-time updates
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from sqlalchemy.orm import Session
 from datetime import datetime
 import json
-import os
-from typing import Dict, Any, List
 
-# ==================== APP SETUP ====================
+from database import engine, init_db, db_session
+from models import (
+    Room, Guest, Reservation, Transaction, LoyaltyTransaction, WalkInTransaction,
+    Order, Employee, MaintenanceRequest, RoomType, Settings, SyncLog,
+    RoomStatusEnum, MaintenanceStatusEnum, LoyaltyTierEnum
+)
+
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.config['SECRET_KEY'] = 'tide-hotels-secret-key-change-in-production'
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Use 'threading' async mode for Python 3.13 compatibility
+# Initialize SocketIO
+# Using 'threading' mode to be compatible with Python 3.13
+# For production with high concurrency, you can switch to 'eventlet' or 'gevent' on Python <=3.12
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ==================== DATA STORAGE ====================
-DATA_FILE = 'hotel_data.json'
+# Initialize database
+init_db()
 
-INITIAL_DATA = {
-    'rooms': [],
-    'guests': [],
-    'reservations': [],
-    'transactions': [],
-    'loyaltyTransactions': [],
-    'walkInTransactions': [],
-    'orders': [],
-    'employees': [],
-    'syncLog': [],
-    'maintenanceRequests': [],
-    'roomTypes': [],
-    'taxSettings': {'isEnabled': True, 'rate': 7.5},
-    'stopSell': {}
-}
+# Helper function to broadcast data updates
+def broadcast_data_update():
+    """Send complete data state to all connected clients"""
+    data = get_all_data()
+    socketio.emit('data_update', data, broadcast=True)
 
-hotel_data = INITIAL_DATA.copy()
-
-id_counters = {
-    'rooms': 1,
-    'guests': 1,
-    'reservations': 1,
-    'transactions': 1,
-    'loyaltyTransactions': 1,
-    'walkInTransactions': 1,
-    'orders': 1,
-    'employees': 1,
-    'maintenanceRequests': 1,
-    'roomTypes': 1
-}
-
-# ==================== DATA FUNCTIONS ====================
-
-def load_data():
-    """Load data from file if it exists"""
-    global hotel_data, id_counters
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                loaded_data = json.load(f)
-                hotel_data = loaded_data.get('data', INITIAL_DATA.copy())
-                id_counters = loaded_data.get('counters', id_counters.copy())
-        except Exception as e:
-            print(f"Error loading data: {e}")
-            hotel_data = INITIAL_DATA.copy()
-
-def save_data():
-    """Save data to file"""
+def get_all_data():
+    """Retrieve all data from database"""
     try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump({
-                'data': hotel_data,
-                'counters': id_counters
-            }, f, indent=2)
+        tax_setting = db_session.query(Settings).filter_by(key='tax_settings').first()
+        tax_settings = json.loads(tax_setting.value) if tax_setting else {'isEnabled': True, 'rate': 7.5}
+
+        stop_sell_setting = db_session.query(Settings).filter_by(key='stop_sell').first()
+        stop_sell = json.loads(stop_sell_setting.value) if stop_sell_setting else {}
+
+        return {
+            'roomTypes': [rt.to_dict() for rt in db_session.query(RoomType).all()],
+            'rooms': [r.to_dict() for r in db_session.query(Room).all()],
+            'guests': [g.to_dict() for g in db_session.query(Guest).all()],
+            'reservations': [r.to_dict() for r in db_session.query(Reservation).all()],
+            'transactions': [t.to_dict() for t in db_session.query(Transaction).all()],
+            'loyaltyTransactions': [lt.to_dict() for lt in db_session.query(LoyaltyTransaction).all()],
+            'walkInTransactions': [wt.to_dict() for wt in db_session.query(WalkInTransaction).all()],
+            'orders': [o.to_dict() for o in db_session.query(Order).all()],
+            'employees': [e.to_dict() for e in db_session.query(Employee).all()],
+            'maintenanceRequests': [mr.to_dict() for mr in db_session.query(MaintenanceRequest).all()],
+            'syncLog': [sl.to_dict() for sl in db_session.query(SyncLog).order_by(SyncLog.id.desc()).limit(50).all()],
+            'taxSettings': tax_settings,
+            'stopSell': stop_sell
+        }
     except Exception as e:
-        print(f"Error saving data: {e}")
+        print(f"Error getting all data: {e}")
+        return {}
 
-def broadcast_update():
-    """Broadcast data update to all connected clients"""
-    socketio.emit('data_update', hotel_data, broadcast=True)
-    save_data()
+# ============= REST API ENDPOINTS =============
+# ... Keep all your existing REST API routes unchanged ...
 
-def add_sync_log(message: str, level: str = 'info'):
-    """Add entry to sync log"""
-    log_entry = {
-        'timestamp': datetime.now().strftime('%H:%M:%S'),
-        'message': message,
-        'level': level
-    }
-    hotel_data['syncLog'].insert(0, log_entry)
-    if len(hotel_data['syncLog']) > 100:
-        hotel_data['syncLog'] = hotel_data['syncLog'][:100]
-
-def get_next_id(entity: str) -> int:
-    """Get next ID for an entity"""
-    current_id = id_counters[entity]
-    id_counters[entity] += 1
-    return current_id
-
-# Initialize data on startup
-load_data()
-
-# ==================== API ROUTES ====================
-
-@app.route('/api/data', methods=['GET'])
-def get_data():
-    """Get all hotel data"""
-    return jsonify(hotel_data)
-
-@app.route('/api/data/clear', methods=['POST'])
-def clear_data():
-    """Clear all data (except room types and settings)"""
-    global hotel_data
-    hotel_data = {
-        'rooms': [],
-        'guests': [],
-        'reservations': [],
-        'transactions': [],
-        'loyaltyTransactions': [],
-        'walkInTransactions': [],
-        'orders': [],
-        'employees': [],
-        'syncLog': [],
-        'maintenanceRequests': [],
-        'roomTypes': hotel_data.get('roomTypes', []),
-        'taxSettings': hotel_data.get('taxSettings', {'isEnabled': True, 'rate': 7.5}),
-        'stopSell': {}
-    }
-    add_sync_log('All data cleared', 'warn')
-    broadcast_update()
-    return jsonify({'success': True}), 200
-
-# ==================== SOCKET.IO HANDLERS ====================
+# ============= WEBSOCKET EVENTS =============
 
 @socketio.on('connect')
 def handle_connect():
+    """Handle client connection"""
     print('Client connected')
-    emit('data_update', hotel_data)
+    emit('data_update', get_all_data())
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    """Handle client disconnection"""
     print('Client disconnected')
 
-# ==================== MAIN ENTRY ====================
+# ============= RUN SERVER =============
 
 if __name__ == '__main__':
-    print("✅ Tid Hotels PMS API running on http://127.0.0.1:5000")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    print("Starting Tidé Hotels PMS Backend Server...")
+    print("Server running on http://localhost:5001")
+    # Using 'threading' mode, compatible with Python 3.13
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
